@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "dvsportal"
-version = "1.0.0"
+version = "1.1.0"
 description = "Asynchronous Python client for the DVSPortal API as used by Dutch muncipalities for guest parking."
 authors = ["ChessSpider <chessspider@gmail.com>"]
 readme = "README.md"
