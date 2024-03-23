@@ -135,17 +135,29 @@ class DVSPortal:
             )
 
         return response_json
+    
+    async def fetch_default_type_id(self) -> None:
+        """Fetches the default permit media type ID."""
+        try:
+            response = await self._request("login", method="GET")  # Adjust if the URI is different for the GET request.
+            self._default_type_id = response["PermitMediaTypes"][0]["ID"]
+        except KeyError as e:
+            raise DVSPortalError("Failed to fetch default type ID: Missing key in response") from e
+
 
     async def token(self) -> Optional[int]:
         """Return token."""
         if self._token is None:
+            if self._default_type_id is None:
+                await self.fetch_default_type_id()
+
             response = await self._request(
                 "login",
                 json={
                     "identifier": self._identifier,
                     "loginMethod": "Pas",
                     "password": self._password,
-                    "permitMediaTypeID": 1}
+                    "permitMediaTypeID": self._default_type_id}
             )
             self._token = response["Token"]
         return self._token
@@ -291,7 +303,7 @@ class DVSPortal:
         authorization_header = await self.authorization_header()
         permit_media_code = permit_media_code or self.default_code
         payload = {
-            "permitMediaTypeID": 1,
+            "permitMediaTypeID": self.default_type_id,
             "permitMediaCode": permit_media_code,
             "licensePlate": {
                 "Value": license_plate,
