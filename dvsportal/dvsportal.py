@@ -155,7 +155,7 @@ class DVSPortal:
         }
 
         try:
-            with async_timeout.timeout(self.request_timeout):
+            async with async_timeout.timeout(self.request_timeout):
                 response = await self._session.request(
                     method, url, json=json, headers={**default_headers, **headers}, ssl=True
                 )
@@ -388,7 +388,7 @@ class DVSPortal:
 
     async def close(self) -> None:
         """Close open client session."""
-        if self._close_session:
+        if self._session and not self._session.closed:
             await self._session.close()
 
     async def __aenter__(self) -> "DVSPortal":
