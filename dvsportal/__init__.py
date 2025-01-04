@@ -1,9 +1,29 @@
-# -*- coding: utf-8 -*-
 """Asynchronous Python client for the DVSPortal API."""
 
 from .dvsportal import (
     DVSPortal,
-    DVSPortalError,
+    HistoricReservation,
+    LicensePlate,
+    Permit,
+    PermitMedia,
+    Reservation,
+    UpstreamReservation,
+)
+from .exceptions import (
     DVSPortalAuthError,
     DVSPortalConnectionError,
+    DVSPortalError,
 )
+
+__all__ = [
+    "DVSPortal",
+    "DVSPortalAuthError",
+    "DVSPortalConnectionError",
+    "DVSPortalError",
+    "LicensePlate",
+    "UpstreamReservation",
+    "Reservation",
+    "PermitMedia",
+    "Permit",
+    "HistoricReservation",
+]

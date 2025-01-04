@@ -35,4 +35,4 @@ jobs:
         run: poetry run mypy .
 
       - name: Run Tests (pytest)
-        run: poetry run pytest --cov=DVSPortal --cov-report=term-missing
+        run: poetry run pytest

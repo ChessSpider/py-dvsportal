@@ -108,7 +108,7 @@ class DVSPortal:
 
         self._balance: float | None = None
         self._unit_price: float | None = None
-        self._active_reservations: list[Reservation] = []
+        self._active_reservations: dict[str, Reservation]= {}
         self._known_license_plates: dict[str, str] = {}
         self._default_type_id: int | None = None
         self._default_code: str | None = None
@@ -123,7 +123,7 @@ class DVSPortal:
         return self._unit_price
 
     @property
-    def active_reservations(self) -> list[Reservation]:
+    def active_reservations(self) -> dict[str, Reservation]:
         return self._active_reservations
 
     @property
@@ -247,8 +247,8 @@ class DVSPortal:
         self._unit_price = response["Permits"][0]["UnitPrice"]
 
         # Map Active Reservations from UpstreamReservation to Reservation
-        self._active_reservations = [
-            {
+        self._active_reservations = {
+            reservation["LicensePlate"]["Value"]: {
                 "reservation_id": reservation["ReservationID"],
                 "valid_from": reservation["ValidFrom"],
                 "valid_until": reservation["ValidUntil"],
@@ -257,8 +257,9 @@ class DVSPortal:
                 "cost": reservation["Units"] * self._unit_price
                 if self._unit_price else None,
             }
-            for reservation in permit_media["ActiveReservations"]
-        ]
+            for reservation in permit_media.get("ActiveReservations", [])
+        }
+
 
         # Map Historic Reservations
         self._historic_reservations = {
@@ -399,12 +400,12 @@ class DVSPortal:
             if self._session and not self._session.closed:
                 await self._session.close()
         except Exception as e:
-            warnings.warn(f"Failed to close session in __aexit__: {e}")
+            warnings.warn(f"Failed to close session in __aexit__: {e}", stacklevel=2)
 
     def __del__(self):
         """Ensure session is closed when object is garbage-collected."""
         if self._session and not self._session.closed:
             warnings.warn(
-                "DVSPortal instance was not properly closed. Call `await close()` or use `async with DVSPortal()`."
+                "DVSPortal instance was not properly closed. Call `await close()` or use `async with DVSPortal()`.", stacklevel=2
             )
             del self._session
