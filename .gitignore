@@ -1,0 +1,85 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+.env/
+env/
+venv/
+
+# Poetry lock file (if specific lock files need ignoring in some cases)
+poetry.lock
+
+# Test and Type Check Caches
+.mypy_cache/
+.pytest_cache/
+
+# pytest result files
+coverage.xml
+*.cover
+*.coverage
+
+# IDE / Editor Config
+.vscode/
+.idea/
+*.iml
+
+# Logs and temp files
+*.log
+*.tmp
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Local environment files
+.env.local
+.env.development.local
+.env.testing.local
+.env.production.local
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Other Python cache or build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# wheel package
+*.whl
+
+# Temporary files
+*.bak
+*.swp
+*.swo
+
+# Pytest results
+htmlcov/
+pytest-debug.log
+
+# Coverage reports
+.coverage
+.cache
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Poetry-specific
+poetry.lock
+
+# AWS SAM build artifacts
+.aws-sam/
+
+# Pyright cache (if used for type-checking)
+.pyright/
+
+# Misc
+*.sqlite3
+*.db

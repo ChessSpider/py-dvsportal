@@ -1,14 +1,11 @@
-# -*- coding: utf-8 -*-
 """Asynchronous Python client for the DVSPortal API."""
 import asyncio
 import base64
-import json
-import re
 import socket
-
-from datetime import datetime, timedelta
-from functools import reduce
-from typing import Dict, Optional, List,Optional,Union
+import warnings
+from asyncio import exceptions as async_exceptions
+from datetime import datetime
+from typing import TypedDict
 
 import aiohttp
 import async_timeout
@@ -22,6 +19,55 @@ from .exceptions import (
     DVSPortalError,
 )
 
+# --- TypedDict Definitions ---
+
+class LicensePlate(TypedDict):
+    Value: str
+    Name: str
+
+
+class UpstreamReservation(TypedDict):
+    ReservationID: str
+    ValidFrom: datetime
+    ValidUntil: datetime
+    LicensePlate: LicensePlate
+    Units: int
+
+
+class Reservation(TypedDict):
+    reservation_id: str
+    valid_from: datetime
+    valid_until: datetime
+    license_plate: str
+    units: int
+    cost: float | None
+
+
+class PermitMedia(TypedDict):
+    TypeID: int
+    Code: str
+    Balance: float
+    RemainingUpgrades: int
+    RemainingDowngrades: int
+    ActiveReservations: list[UpstreamReservation]
+    LicensePlates: list[LicensePlate]
+    History: dict
+
+
+class Permit(TypedDict):
+    PermitMedias: list[PermitMedia]
+    UnitPrice: float
+
+
+class HistoricReservation(TypedDict):
+    ReservationID: str
+    ValidFrom: datetime
+    ValidUntil: datetime
+    Units: int
+
+
+
+# --- DVSPortal Class ---
 
 class DVSPortal:
     """Main class for handling connections with DVSPortal."""
@@ -34,7 +80,7 @@ class DVSPortal:
         loop=None,
         request_timeout: int = 10,
         session=None,
-        user_agent: str = None,
+        user_agent: str | None = None,
     ):
         """Initialize connection with DVSPortal."""
         self._loop = loop
@@ -48,56 +94,58 @@ class DVSPortal:
         self.request_timeout = request_timeout
         self.user_agent = user_agent
 
-        self._token = None
+        self._token: str | None = None
 
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
 
         if self._session is None:
-            self._session = aiohttp.ClientSession(loop=self._loop)
+            self._session = aiohttp.ClientSession()
             self._close_session = True
 
         if self.user_agent is None:
-            self.user_agent = "PythonDVSPortal/{}".format(__version__)
-        
-        self._balance: Optional[float] = None
-        self._unit_price: Optional[float] = None
-        self._active_reservations: List[Dict[str, Optional[Union[datetime, str, int, float]]]] = []
-        self._known_license_plates: Dict[str, str] = {}
-        self._default_type_id: Optional[int] = None
-        self._default_code: Optional[str] = None
-        self._historic_reservations : Dict[str, Dict[str, Union[str, datetime]]] = {}
+            self.user_agent = f"PythonDVSPortal/{__version__}"
+
+        self._balance: float | None = None
+        self._unit_price: float | None = None
+        self._active_reservations: list[Reservation] = []
+        self._known_license_plates: dict[str, str] = {}
+        self._default_type_id: int | None = None
+        self._default_code: str | None = None
+        self._historic_reservations: dict[str, HistoricReservation] = {}
 
     @property
-    def balance(self) -> Optional[float]:
+    def balance(self) -> float | None:
         return self._balance
 
     @property
-    def unit_price(self) -> Optional[float]:
+    def unit_price(self) -> float | None:
         return self._unit_price
 
     @property
-    def active_reservations(self) -> List[Dict[str, Optional[Union[datetime, str, int, float]]]]:
+    def active_reservations(self) -> list[Reservation]:
         return self._active_reservations
 
     @property
-    def known_license_plates(self) -> Dict[str, str]:
+    def known_license_plates(self) -> dict[str, str]:
         return self._known_license_plates
 
     @property
-    def default_type_id(self) -> Optional[int]:
+    def default_type_id(self) -> int | None:
         return self._default_type_id
 
     @property
-    def default_code(self) -> Optional[str]:
+    def default_code(self) -> str | None:
         return self._default_code
-    
+
     @property
-    def historic_reservations(self):
+    def historic_reservations(self) -> dict[str, HistoricReservation]:
         return self._historic_reservations
 
-    async def _request(self, uri: str, method: str = "POST", json={}, headers={}):
+    async def _request(self, uri: str, method: str = "POST", json=None, headers=None):
         """Handle a request to DVSPortal."""
+        json = json or {}
+        headers = headers or {}
         url = URL.build(
             scheme="https", host=self.api_host, port=443, path=API_BASE_URI
         ).join(URL(uri))
@@ -111,7 +159,7 @@ class DVSPortal:
                 response = await self._session.request(
                     method, url, json=json, headers={**default_headers, **headers}, ssl=True
                 )
-        except asyncio.TimeoutError as exception:
+        except async_exceptions.TimeoutError as exception:
             raise DVSPortalConnectionError(
                 "Timeout occurred while connecting to DVSPortal API."
             ) from exception
@@ -135,17 +183,16 @@ class DVSPortal:
             )
 
         return response_json
-    
+
     async def fetch_default_type_id(self) -> None:
         """Fetches the default permit media type ID."""
         try:
-            response = await self._request("login", method="GET")  # Adjust if the URI is different for the GET request.
+            response = await self._request("login", method="GET")
             self._default_type_id = response["PermitMediaTypes"][0]["ID"]
         except KeyError as e:
             raise DVSPortalError("Failed to fetch default type ID: Missing key in response") from e
 
-
-    async def token(self) -> Optional[int]:
+    async def token(self) -> str | None:
         """Return token."""
         if self._token is None:
             if self._default_type_id is None:
@@ -157,15 +204,23 @@ class DVSPortal:
                     "identifier": self._identifier,
                     "loginMethod": "Pas",
                     "password": self._password,
-                    "permitMediaTypeID": self._default_type_id}
+                    "permitMediaTypeID": self._default_type_id
+                }
             )
+
+            if response.get("LoginStatus") == 2:
+                raise DVSPortalAuthError(
+                    f"Authentication failed: {response.get('ErrorMessage', 'Unknown authentication error')}"
+                )
+
             self._token = response["Token"]
+
         return self._token
 
-    async def authorization_header(self):
+    async def authorization_header(self) -> dict[str, str]:
         await self.token()
         return {
-            "Authorization": "Token " + str(base64.b64encode(self._token.encode("utf-8")), "utf-8")
+            "Authorization": "Token " + str(base64.b64encode(str(self._token).encode("utf-8")), "utf-8")
         }
 
     async def update(self) -> None:
@@ -177,83 +232,83 @@ class DVSPortal:
             "login/getbase",
             headers=authorization_header
         )
-        
 
+        if not response.get("Permits"):
+            raise DVSPortalError("No zonal code found")
         if len(response["Permits"]) > 1:
-            raise Exception("More than one zonal code found")
-        elif len(response["Permits"]) == 0 :
-            raise Exception("No zonal code found")
+            raise DVSPortalError("More than one zonal code found")
 
-        if response["Permits"]:
-            self._default_type_id = response["Permits"][0]["PermitMedias"][0].get("TypeID")
-            self._default_code = response["Permits"][0]["PermitMedias"][0].get("Code")
+        permit_media: PermitMedia = response["Permits"][0]["PermitMedias"][0]
 
+        self._default_type_id = permit_media["TypeID"]
+        self._default_code = permit_media["Code"]
 
-        # get the first permit media (assuming there is at least one)
-        permit_media = response["Permits"][0]["PermitMedias"][0] if response["Permits"] else {}
+        self._balance = permit_media["Balance"]
+        self._unit_price = response["Permits"][0]["UnitPrice"]
 
-        self._balance = {
-            'balance': permit_media.get("Balance"),
-            'remaining_upgrades': permit_media.get('RemainingUpgrades'),
-            'remaining_downgrades': permit_media.get('RemainingDowngrades')
-        }
-        self._unit_price = response["Permits"][0].get("UnitPrice")
-        self._active_reservations = {
-            reservation["LicensePlate"].get("Value"): {
-                "reservation_id": reservation.get("ReservationID"),
-                "valid_from": reservation.get("ValidFrom"),
-                "valid_until": reservation.get("ValidUntil"),
-                "license_plate": reservation["LicensePlate"].get("Value"),
-                "units": reservation.get("Units"),
-                "cost": reservation.get("Units") * self.unit_price if self.unit_price and reservation.get("Units") is not None else None,
+        # Map Active Reservations from UpstreamReservation to Reservation
+        self._active_reservations = [
+            {
+                "reservation_id": reservation["ReservationID"],
+                "valid_from": reservation["ValidFrom"],
+                "valid_until": reservation["ValidUntil"],
+                "license_plate": reservation["LicensePlate"]["Value"],
+                "units": reservation["Units"],
+                "cost": reservation["Units"] * self._unit_price
+                if self._unit_price else None,
             }
-            for reservation in permit_media.get("ActiveReservations", {})
+            for reservation in permit_media["ActiveReservations"]
+        ]
+
+        # Map Historic Reservations
+        self._historic_reservations = {
+            item["LicensePlate"]["Value"]: {
+                "ReservationID": item["ReservationID"],
+                "ValidFrom": item["ValidFrom"],
+                "ValidUntil": item["ValidUntil"],
+                "Units": item["Units"],
+            }
+            for item in permit_media["History"]["Reservations"]["Items"]
+            if item["LicensePlate"]["DisplayValue"] != '********'
         }
-        
+
+        # Known License Plates
         history_license_plates = {
-            item["LicensePlate"]["DisplayValue"]: None
-            for item in permit_media.get("History", {}).get("Reservations", {}).get("Items", [])
-            if item["LicensePlate"]["DisplayValue"] != '********' # ignore forgotten license
+            item["LicensePlate"]["DisplayValue"]: ""
+            for item in permit_media["History"]["Reservations"]["Items"]
+            if item["LicensePlate"]["DisplayValue"] != '********'
         }
 
-        # Extract license plates from active reservations
         active_license_plates = {
-            reservation["LicensePlate"]["Value"]: None
-            for reservation in permit_media.get("ActiveReservations", [])
+            reservation["LicensePlate"]["Value"]: ""
+            for reservation in permit_media["ActiveReservations"]
         }
 
-        # Extract license plates with names from PermitMedias
         named_license_plates = {
             plate["Value"]: plate["Name"]
-            for plate in permit_media.get("LicensePlates", [])
+            for plate in permit_media["LicensePlates"]
         }
 
-        # Merge all license plates
-        self._known_license_plates = {**history_license_plates, **active_license_plates, **named_license_plates}
+        self._known_license_plates = {
+            **history_license_plates,
+            **active_license_plates,
+            **named_license_plates
+        }
 
 
-        recent_reservations = {}
-        for item in permit_media.get("History", {}).get("Reservations", {}).get("Items", []):
-            license_plate = item["LicensePlate"]["DisplayValue"]
-            if license_plate == '*********':
-                continue 
-            license_plate = item["LicensePlate"]["Value"]
-            valid_until = item["ValidUntil"]
-            if license_plate not in recent_reservations:
-                recent_reservations[license_plate] = {
-                    "ReservationID": item["ReservationID"],
-                    "ValidFrom": item["ValidFrom"],
-                    "ValidUntil": valid_until,
-                    "Units": item["Units"],
-                }
-        self._historic_reservations = recent_reservations
-
-    async def end_reservation(self,*, reservation_id, type_id=None, code=None):
-        """Ends reservation"""
+    async def end_reservation(
+        self,
+        *,
+        reservation_id: str,
+        type_id: int | None = None,
+        code: str | None = None
+    ) -> dict:
+        """End a reservation."""
         if type_id is None:
             type_id = self.default_type_id
         if code is None:
             code = self.default_code
+
         authorization_header = await self.authorization_header()
 
         return await self._request(
@@ -267,21 +322,22 @@ class DVSPortal:
         )
 
     async def create_reservation(
-        self, 
-        license_plate_value=None, 
-        license_plate_name=None, 
-        type_id=None, 
-        code=None, 
-        date_from: Optional[datetime] = None, 
-        date_until: Optional[datetime] = None
-    ):
+        self,
+        license_plate_value: str | None = None,
+        license_plate_name: str | None = None,
+        type_id: int | None = None,
+        code: str | None = None,
+        date_from: datetime | None = None,
+        date_until: datetime | None = None
+    ) -> dict:
+        """Create a reservation."""
         if type_id is None:
             type_id = self.default_type_id
         if code is None:
             code = self.default_code
         if date_from is None:
             date_from = datetime.now()
-        
+
         request_data = {
             "DateFrom": date_from.isoformat(),
             "LicensePlate": {
@@ -291,7 +347,7 @@ class DVSPortal:
             "permitMediaTypeID": type_id,
             "permitMediaCode": code
         }
-        
+
         if date_until:
             request_data["DateUntil"] = date_until.isoformat()
 
@@ -303,9 +359,16 @@ class DVSPortal:
             json=request_data
         )
 
-    async def store_license_plate(self, license_plate: str, name: str, permit_media_code: Optional[str] = None):
+    async def store_license_plate(
+        self,
+        license_plate: str,
+        name: str,
+        permit_media_code: str | None = None
+    ) -> dict:
+        """Store a license plate."""
         authorization_header = await self.authorization_header()
         permit_media_code = permit_media_code or self.default_code
+
         payload = {
             "permitMediaTypeID": self.default_type_id,
             "permitMediaCode": permit_media_code,
@@ -315,6 +378,7 @@ class DVSPortal:
             },
             "updateLicensePlate": None
         }
+
         return await self._request(
             "permitmedialicenseplate/upsert",
             headers=authorization_header,
@@ -330,6 +394,17 @@ class DVSPortal:
         """Async enter."""
         return self
 
-    async def __aexit__(self, *exc_info) -> None:
-        """Async exit."""
-        await self.close()
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        try:
+            if self._session and not self._session.closed:
+                await self._session.close()
+        except Exception as e:
+            warnings.warn(f"Failed to close session in __aexit__: {e}")
+
+    def __del__(self):
+        """Ensure session is closed when object is garbage-collected."""
+        if self._session and not self._session.closed:
+            warnings.warn(
+                "DVSPortal instance was not properly closed. Call `await close()` or use `async with DVSPortal()`."
+            )
+            del self._session
