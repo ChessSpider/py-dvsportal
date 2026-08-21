@@ -12,7 +12,7 @@ import async_timeout
 from yarl import URL
 
 from .__version__ import __version__
-from .const import API_BASE_URI
+from .const import API_BASE_URI, CITYPERMIT_API_BASE_URI
 from .exceptions import (
     DVSPortalAuthError,
     DVSPortalConnectionError,
@@ -81,8 +81,14 @@ class DVSPortal:
         request_timeout: int = 10,
         session=None,
         user_agent: str | None = None,
+        api_base_uri: str | None = None,
     ):
-        """Initialize connection with DVSPortal."""
+        """Initialize connection with DVSPortal.
+
+        ``api_base_uri`` is optional; when omitted it is auto-detected between
+        the legacy ``/DVSWebAPI/api/`` path and the newer Sigmax CityPermit
+        gateway path ``/DVSPortal/api/``.
+        """
         self._loop = loop
         self._session = session
         self._close_session = False
@@ -95,6 +101,11 @@ class DVSPortal:
         self.user_agent = user_agent
 
         self._token: str | None = None
+        #: True = new Sigmax CityPermit gateway (cookie/XSRF auth, int
+        #: LoginMethod enum); False = legacy bearer-token API; None = undetected.
+        self._citypermit_gateway: bool | None = None
+        self._explicit_base_uri = api_base_uri is not None
+        self._api_base_uri = api_base_uri or API_BASE_URI
 
         if self._loop is None:
             self._loop = asyncio.get_event_loop()
@@ -147,7 +158,7 @@ class DVSPortal:
         json = json or {}
         headers = headers or {}
         url = URL.build(
-            scheme="https", host=self.api_host, port=443, path=API_BASE_URI
+            scheme="https", host=self.api_host, port=443, path=self._api_base_uri
         ).join(URL(uri))
 
         default_headers = {
@@ -185,43 +196,126 @@ class DVSPortal:
         return response_json
 
     async def fetch_default_type_id(self) -> None:
-        """Fetches the default permit media type ID."""
+        """Fetch the default permit media type ID.
+
+        Also auto-detects the API base path: legacy portals serve the API at
+        ``/DVSWebAPI/api/`` while the newer Sigmax CityPermit gateway (e.g.
+        Groningen) uses ``/DVSPortal/api/``. An explicitly configured
+        ``api_base_uri`` is never overridden.
+        """
+        candidates = (
+            (self._api_base_uri,)
+            if self._explicit_base_uri
+            else (API_BASE_URI, CITYPERMIT_API_BASE_URI)
+        )
+        for base in candidates:
+            self._api_base_uri = base
+            try:
+                response = await self._request("login", method="GET")
+                self._default_type_id = response["PermitMediaTypes"][0]["ID"]
+                return
+            except KeyError as e:
+                raise DVSPortalError(
+                    "Failed to fetch default type ID: Missing key in response"
+                ) from e
+            except DVSPortalError:
+                # e.g. 404/HTML on the wrong base path — try the next one
+                continue
+        raise DVSPortalError(
+            "Could not reach DVSPortal API on any known base path"
+        )
+
+    @staticmethod
+    def _looks_like_citypermit_login_error(err: DVSPortalError) -> bool:
+        """True if the error is a CityPermit model-validation 400 on loginMethod.
+
+        The CityPermit gateway expects the LoginMethod enum as an integer and
+        rejects the legacy string value with a 400 model-validation error.
+        """
         try:
-            response = await self._request("login", method="GET")
-            self._default_type_id = response["PermitMediaTypes"][0]["ID"]
-        except KeyError as e:
-            raise DVSPortalError("Failed to fetch default type ID: Missing key in response") from e
+            args = err.args
+            status = args[0] if args else None
+            payload = args[1] if len(args) > 1 else {}
+            return status == 400 and "loginmethod" in str(payload).lower()
+        except Exception:  # noqa: BLE001 - never break auth on parse issues
+            return False
 
     async def token(self) -> str | None:
-        """Return token."""
+        """Authenticate and return a session marker.
+
+        Returns the bearer token on the legacy API, or the sentinel
+        ``"cookie-session"`` on the newer Sigmax CityPermit gateway (which
+        authenticates via session cookies set by the login response).
+        """
         if self._token is None:
             if self._default_type_id is None:
                 await self.fetch_default_type_id()
 
-            response = await self._request(
-                "login",
-                json={
-                    "identifier": self._identifier,
-                    "loginMethod": "Pas",
-                    "password": self._password,
-                    "permitMediaTypeID": self._default_type_id
-                }
-            )
+            try:
+                response = await self._request(
+                    "login",
+                    json={
+                        "identifier": self._identifier,
+                        "loginMethod": "Pas",
+                        "password": self._password,
+                        "permitMediaTypeID": self._default_type_id,
+                    },
+                )
+                self._citypermit_gateway = False
+            except DVSPortalError as err:
+                if not self._looks_like_citypermit_login_error(err):
+                    raise
+                self._citypermit_gateway = True
+                response = await self._request(
+                    "login",
+                    json={
+                        "identifier": self._identifier,
+                        # CityPermit LoginMethod is an integer enum (Pas = 2)
+                        "loginMethod": 2,
+                        "password": self._password,
+                        "permitMediaTypeID": self._default_type_id,
+                    },
+                )
 
             if response.get("LoginStatus") == 2:
                 raise DVSPortalAuthError(
                     f"Authentication failed: {response.get('ErrorMessage', 'Unknown authentication error')}"
                 )
 
-            self._token = response["Token"]
+            if self._citypermit_gateway:
+                self._token = "cookie-session"
+            else:
+                self._token = response["Token"]
 
         return self._token
 
     async def authorization_header(self) -> dict[str, str]:
+        """Return the auth header for authenticated calls."""
         await self.token()
+        if self._citypermit_gateway:
+            return self._citypermit_headers()
         return {
-            "Authorization": "Token " + str(base64.b64encode(str(self._token).encode("utf-8")), "utf-8")
+            "Authorization": "Token "
+            + str(base64.b64encode(str(self._token).encode("utf-8")), "utf-8")
         }
+
+    def _citypermit_headers(self) -> dict[str, str]:
+        """XSRF header for the CityPermit gateway (cookie-based auth)."""
+        try:
+            cookies = self._session.cookie_jar.filter_cookies(
+                URL.build(scheme="https", host=self.api_host, port=443)
+            )
+            if "Xsrf-DVSPortal" in cookies:
+                return {"X-XSRF-TOKEN": cookies["Xsrf-DVSPortal"].value}
+        except Exception:  # noqa: BLE001 - never block calls on cookie issues
+            pass
+        return {}
+
+    @staticmethod
+    def _clean_dt(value) -> str:
+        """Normalize gateway timestamps (e.g. ``2026-08-21T21:59:00Z``) to
+        naive ISO strings without ``Z`` or microseconds."""
+        return str(value).rstrip("Z").split(".", maxsplit=1)[0]
 
     async def update(self) -> None:
         """Fetch data from DVSPortal."""
@@ -250,8 +344,8 @@ class DVSPortal:
         self._active_reservations = {
             reservation["LicensePlate"]["Value"]: {
                 "reservation_id": reservation["ReservationID"],
-                "valid_from": reservation["ValidFrom"],
-                "valid_until": reservation["ValidUntil"],
+                "valid_from": self._clean_dt(reservation["ValidFrom"]),
+                "valid_until": self._clean_dt(reservation["ValidUntil"]),
                 "license_plate": reservation["LicensePlate"]["Value"],
                 "units": reservation["Units"],
                 "cost": reservation["Units"] * self._unit_price
@@ -260,23 +354,25 @@ class DVSPortal:
             for reservation in permit_media.get("ActiveReservations", [])
         }
 
+        # Map Historic Reservations (History may be null on the CityPermit gateway)
+        history = permit_media.get("History") or {}
+        history_items = (history.get("Reservations") or {}).get("Items") or []
 
-        # Map Historic Reservations
         self._historic_reservations = {
             item["LicensePlate"]["Value"]: {
                 "ReservationID": item["ReservationID"],
-                "ValidFrom": item["ValidFrom"],
-                "ValidUntil": item["ValidUntil"],
+                "ValidFrom": self._clean_dt(item["ValidFrom"]),
+                "ValidUntil": self._clean_dt(item["ValidUntil"]),
                 "Units": item["Units"],
             }
-            for item in permit_media["History"]["Reservations"]["Items"]
+            for item in history_items
             if item["LicensePlate"]["DisplayValue"] != '********'
         }
 
         # Known License Plates
         history_license_plates = {
             item["LicensePlate"]["DisplayValue"]: ""
-            for item in permit_media["History"]["Reservations"]["Items"]
+            for item in history_items
             if item["LicensePlate"]["DisplayValue"] != '********'
         }
 
@@ -339,20 +435,35 @@ class DVSPortal:
         if date_from is None:
             date_from = datetime.now()
 
-        request_data = {
-            "DateFrom": date_from.isoformat(),
-            "LicensePlate": {
-                "Value": license_plate_value,
-                "Name": license_plate_name
-            },
-            "permitMediaTypeID": type_id,
-            "permitMediaCode": code
-        }
-
-        if date_until:
-            request_data["DateUntil"] = date_until.isoformat()
-
+        # Ensures login + gateway detection ran before we pick the payload
+        # format (legacy vs CityPermit).
         authorization_header = await self.authorization_header()
+
+        if self._citypermit_gateway:
+            request_data = {
+                "reservation": {
+                    "DateFrom": date_from.isoformat(),
+                    "DateUntil": date_until.isoformat() if date_until else None,
+                },
+                "LicensePlate": {
+                    "Value": license_plate_value,
+                    "Name": license_plate_name,
+                },
+                "PermitMediaCode": code,
+                "PermitMediaTypeID": type_id,
+            }
+        else:
+            request_data = {
+                "DateFrom": date_from.isoformat(),
+                "LicensePlate": {
+                    "Value": license_plate_value,
+                    "Name": license_plate_name,
+                },
+                "permitMediaTypeID": type_id,
+                "permitMediaCode": code,
+            }
+            if date_until:
+                request_data["DateUntil"] = date_until.isoformat()
 
         return await self._request(
             "reservation/create",

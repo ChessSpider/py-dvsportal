@@ -4,11 +4,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
+from yarl import URL
 
 from dvsportal import DVSPortal
 from dvsportal.exceptions import (
     DVSPortalAuthError,
     DVSPortalConnectionError,
+    DVSPortalError,
 )
 
 
@@ -251,3 +253,162 @@ async def test_close_session(dvsportal: DVSPortal):
     with patch.object(dvsportal._session, "close", new=AsyncMock()) as mock_close:
         await dvsportal.close()
         mock_close.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# New Sigmax CityPermit gateway (e.g. Groningen: aanvraagparkeren.groningen.nl)
+# ---------------------------------------------------------------------------
+
+CITYPERMIT_400 = DVSPortalError(400, {
+    "title": "One or more validation errors occurred.",
+    "errors": {"$.loginMethod": ["The JSON value could not be converted to Sigmax.CityPermit.DVS.ApiGateway.Enums.LoginMethod."]},
+})
+
+
+@pytest.mark.asyncio
+async def test_citypermit_login_uses_integer_method_and_cookie_auth(dvsportal: DVSPortal):
+    """CityPermit: string LoginMethod -> 400, int retry succeeds; auth is
+    cookie/XSRF based (no bearer token in the login response)."""
+    login_payloads = []
+
+    async def mock_request_side_effect(uri: str, method: str = "POST", json=None, headers=None):
+        if method == "GET" and uri == "login":
+            return {"PermitMediaTypes": [{"ID": 4}], "LoginMethods": ["Pas"]}
+        if method == "POST" and uri == "login":
+            login_payloads.append(json or {})
+            if (json or {}).get("loginMethod") == "Pas":
+                raise CITYPERMIT_400
+            # CityPermit returns base data, no Token, and sets cookies
+            return {"Name": "", "Permits": [], "Configuration": {}}
+        return {}
+
+    with patch.object(dvsportal, "_request", side_effect=mock_request_side_effect):
+        token = await dvsportal.token()
+
+    assert dvsportal._citypermit_gateway is True
+    assert token == "cookie-session"
+    assert login_payloads[0]["loginMethod"] == "Pas"
+    assert login_payloads[1]["loginMethod"] == 2
+
+    # XSRF header comes from the session cookie jar, not a bearer token
+    dvsportal._session.cookie_jar.update_cookies(
+        {"Xsrf-DVSPortal": "xsrf-token-123"},
+        URL("https://api.dvsportal.test/"),
+    )
+    headers = await dvsportal.authorization_header()
+    assert headers == {"X-XSRF-TOKEN": "xsrf-token-123"}
+
+
+@pytest.mark.asyncio
+async def test_citypermit_bad_credentials_raises_auth_error(dvsportal: DVSPortal):
+    """CityPermit with wrong credentials -> LoginStatus 2 -> AuthError."""
+
+    async def mock_request_side_effect(uri: str, method: str = "POST", json=None, headers=None):
+        if method == "GET" and uri == "login":
+            return {"PermitMediaTypes": [{"ID": 4}]}
+        if method == "POST" and uri == "login":
+            if (json or {}).get("loginMethod") == "Pas":
+                raise CITYPERMIT_400
+            return {"ErrorMessage": "Het nummer of de pincode is incorrect.", "LoginStatus": 2}
+        return {}
+
+    with patch.object(dvsportal, "_request", side_effect=mock_request_side_effect):
+        with pytest.raises(DVSPortalAuthError):
+            await dvsportal.token()
+
+
+@pytest.mark.asyncio
+async def test_citypermit_create_reservation_payload(dvsportal: DVSPortal):
+    """CityPermit create payload: PascalCase + 'reservation' wrapper."""
+    created = {}
+
+    async def mock_request_side_effect(uri: str, method: str = "POST", json=None, headers=None):
+        if method == "GET" and uri == "login":
+            return {"PermitMediaTypes": [{"ID": 4}]}
+        if method == "POST" and uri == "login":
+            if (json or {}).get("loginMethod") == "Pas":
+                raise CITYPERMIT_400
+            return {"Name": "", "Permits": []}
+        if method == "POST" and uri == "reservation/create":
+            created.update(json or {})
+            return {"Permits": []}
+        return {}
+
+    with patch.object(dvsportal, "_request", side_effect=mock_request_side_effect):
+        await dvsportal.create_reservation(
+            license_plate_value="RN258H",
+            license_plate_name="Nini",
+            type_id=1,
+            code="13507",
+            date_from=datetime(2026, 8, 22, 2, 0),
+            date_until=datetime(2026, 8, 22, 2, 10),
+        )
+
+    assert created["reservation"]["DateFrom"] == "2026-08-22T02:00:00"
+    assert created["reservation"]["DateUntil"] == "2026-08-22T02:10:00"
+    assert created["LicensePlate"] == {"Value": "RN258H", "Name": "Nini"}
+    assert created["PermitMediaCode"] == "13507"
+    assert created["PermitMediaTypeID"] == 1
+
+
+@pytest.mark.asyncio
+async def test_update_citypermit_null_history_and_z_timestamps(dvsportal: DVSPortal):
+    """update() must not crash on History: null and must normalize Z timestamps."""
+
+    async def mock_request_side_effect(uri: str, method: str = "POST", json=None, headers=None):
+        if method == "GET" and uri == "login":
+            return {"PermitMediaTypes": [{"ID": 4}]}
+        if method == "POST" and uri == "login":
+            if (json or {}).get("loginMethod") == "Pas":
+                raise CITYPERMIT_400
+            return {"Name": "", "Permits": []}
+        if method == "POST" and uri == "login/getbase":
+            return {
+                "Name": "",
+                "Permits": [{
+                    "ZoneCode": "10180",
+                    "UnitPrice": 0.006667,
+                    "PermitMedias": [{
+                        "TypeID": 1,
+                        "Code": "13507",
+                        "Balance": 1727.0,
+                        "ActiveReservations": [{
+                            "ReservationID": 8197757,
+                            "ValidFrom": "2026-08-21T12:47:00Z",
+                            "ValidUntil": "2026-08-21T21:59:00.123Z",
+                            "LicensePlate": {"Value": "RN258H", "Name": "Nini"},
+                            "Units": 240,
+                        }],
+                        "LicensePlates": [{"Value": "RN258H", "Name": "Nini"}],
+                        "History": None,
+                    }],
+                }],
+            }
+        return {}
+
+    with patch.object(dvsportal, "_request", side_effect=mock_request_side_effect):
+        await dvsportal.update()
+
+    assert dvsportal.balance == 1727.0
+    assert dvsportal.active_reservations["RN258H"]["valid_from"] == "2026-08-21T12:47:00"
+    assert dvsportal.active_reservations["RN258H"]["valid_until"] == "2026-08-21T21:59:00"
+    assert dvsportal.historic_reservations == {}
+    assert dvsportal.known_license_plates == {"RN258H": "Nini"}
+
+
+@pytest.mark.asyncio
+async def test_base_path_auto_detection(dvsportal: DVSPortal):
+    """A 404/HTML on the legacy base path falls back to the CityPermit path."""
+    seen_bases = []
+
+    async def fake_request(uri: str, method: str = "POST", json=None, headers=None):
+        seen_bases.append(dvsportal._api_base_uri)
+        if dvsportal._api_base_uri == "/DVSWebAPI/api/":
+            raise DVSPortalError(404, {"message": "<html>The resource cannot be found.</html>"})
+        return {"PermitMediaTypes": [{"ID": 4}]}
+
+    with patch.object(dvsportal, "_request", side_effect=fake_request):
+        await dvsportal.fetch_default_type_id()
+
+    assert dvsportal._api_base_uri == "/DVSPortal/api/"
+    assert dvsportal.default_type_id == 4
