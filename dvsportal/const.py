@@ -33,8 +33,11 @@ LOGIN_METHOD_NUMERIC = {
 DEFAULT_LOGIN_METHOD = "Pas"
 
 # The /DVSPortal/api/ flavour protects non-login endpoints with an antiforgery
-# token: the value of this cookie has to be echoed back in this header.
-XSRF_COOKIE_NAME = "__Host-Xsrf-DVSPortal"
+# token: the value of this cookie has to be echoed back in this header. The
+# cookie name differs per portal build: newer ones (Delft) hard-code the
+# __Host- prefixed name in dist/dvs.js, older ones (Hoorn) read the bare name
+# from app.env.js. Accept either.
+XSRF_COOKIE_NAMES = ("__Host-Xsrf-DVSPortal", "Xsrf-DVSPortal")
 XSRF_HEADER_NAME = "X-XSRF-TOKEN"
 
 # History is paginated (10 items per page). Cap how much we walk so a permit

@@ -6,7 +6,7 @@ import pytest
 import pytest_asyncio
 
 from dvsportal import DVSPortal
-from dvsportal.const import API_BASE_URI, API_BASE_URI_PORTAL
+from dvsportal.const import API_BASE_URI, API_BASE_URI_PORTAL, XSRF_HEADER_NAME
 from dvsportal.exceptions import (
     DVSPortalAuthError,
     DVSPortalConnectionError,
@@ -256,6 +256,33 @@ async def test_close_session(dvsportal: DVSPortal):
 
 
 # --- /DVSPortal/api/ flavour ---
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cookie_name", [
+    "__Host-Xsrf-DVSPortal",  # Delft: hard-coded in dist/dvs.js
+    "Xsrf-DVSPortal",         # Hoorn: from app.env.js
+])
+async def test_request_echoes_xsrf_cookie(dvsportal: DVSPortal, cookie_name: str):
+    """Both antiforgery cookie names in the wild end up in the header."""
+    from http.cookies import SimpleCookie
+
+    from yarl import URL
+
+    cookie = SimpleCookie()
+    cookie[cookie_name] = "tok123"
+    dvsportal._session.cookie_jar.update_cookies(
+        cookie, URL("https://api.dvsportal.test/")
+    )
+    with patch.object(dvsportal._session, "request", new=AsyncMock()) as mock_request:
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.headers = {"Content-Type": "application/json"}
+        mock_response.json = AsyncMock(return_value={})
+        mock_request.return_value = mock_response
+
+        await dvsportal._request("/test-endpoint")
+
+    assert mock_request.call_args.kwargs["headers"][XSRF_HEADER_NAME] == "tok123"
 
 def _portal_login_get():
     """GET login as served by the /DVSPortal/api/ flavour."""
