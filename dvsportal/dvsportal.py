@@ -18,7 +18,7 @@ from .const import (
     DEFAULT_LOGIN_METHOD,
     HISTORY_MAX_PAGES,
     LOGIN_METHOD_NUMERIC,
-    XSRF_COOKIE_NAME,
+    XSRF_COOKIE_NAMES,
     XSRF_HEADER_NAME,
 )
 from .exceptions import (
@@ -226,7 +226,7 @@ class DVSPortal:
         if jar is None:
             return None
         for cookie in jar:
-            if cookie.key == XSRF_COOKIE_NAME:
+            if cookie.key in XSRF_COOKIE_NAMES:
                 return cookie.value
         return None
 
