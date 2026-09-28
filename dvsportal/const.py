@@ -34,7 +34,7 @@ DEFAULT_LOGIN_METHOD = "Pas"
 
 # The /DVSPortal/api/ flavour protects non-login endpoints with an antiforgery
 # token: the value of this cookie has to be echoed back in this header.
-XSRF_COOKIE_NAME = "__Host-Xsrf-DVSPortal"
+XSRF_COOKIE_NAME = "Xsrf-DVSPortal"
 XSRF_HEADER_NAME = "X-XSRF-TOKEN"
 
 # History is paginated (10 items per page). Cap how much we walk so a permit
